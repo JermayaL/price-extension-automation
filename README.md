@@ -1,4 +1,4 @@
-README
+**README**
 <ol>
   <li>Insert the script into a Single account.</li>
     <li>It only works if a product group has a minimum of 3 products.</li>
