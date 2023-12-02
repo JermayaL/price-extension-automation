@@ -1,0 +1,184 @@
+function main() {
+    const merchant_id = 650737XXX
+    const days = 30
+    const sales = getStats(days);
+    const products = connectMerchant(merchant_id, sales);
+
+    const labels = [...Object.keys(products)]
+    for (const label of labels) {
+        const label_query = get_label_id(label)
+        if (label_query == null) {
+            Logger.log(`Cant find the label "${label}"`)
+            continue
+        }
+        let adgroups = getAdGroups(label_query)
+        if (adgroups.length == 0) {
+            Logger.log(`The adgroup with label ${label} cant find`)
+        }
+
+        let cat_items = [...Object.values(products[label])].sort(function (a, b) {
+            return b.sales - a.sales;
+        })
+        cat_items = cat_items.splice(0, 4)
+        const cat_arr = cat_items.map(i => `${i.title}|${i.description}|${i.price}|${i.url}`)
+        const searchResults = AdsApp.search(`SELECT ad_group_asset.field_type,
+                                                    ad_group_asset.asset,
+                                                    ad_group.id,
+                                                    asset.price_asset.price_offerings,
+                                                    ad_group.labels,
+                                                    asset.type,
+                                                    asset.id
+                                             FROM ad_group_asset
+                                             WHERE asset.type = "PRICE"
+                                               AND ad_group.id IN (${adgroups.join(", ")})`)
+        for (let row of searchResults) {
+
+            const adgroup_id = row.adGroup.id
+            const asset_id = row.asset.id
+            const offerings = row.asset.priceAsset.priceOfferings.map(i => `${i.header}|${i.description}|${costMicros(i.price.amountMicros)}|${i.finalUrl}`)
+            //offerings
+            //Logger.log(offerings)
+            //Logger.log(cat_arr)
+            //Logger.log(cat_arr.filter(i => offerings.indexOf(i) == -1).length)
+            if (cat_arr.filter(i => offerings.indexOf(i) == -1).length == 0) adgroups = adgroups.filter(i => i != adgroup_id)
+            const adgroupIterator = AdsApp.adGroups().withCondition(`ad_group.id="${adgroup_id}"`).get()
+            if (!adgroupIterator.hasNext()) continue
+            const adgroup = adgroupIterator.next()
+            const priceIterator = AdsApp.extensions().prices().withCondition(`asset.id = ${asset_id}`).get()
+            if (!priceIterator.hasNext()) continue
+            const priceExtension = priceIterator.next()
+            adgroup.removePrice(priceExtension)
+        }
+        if (adgroups.length == 0) continue
+        //Logger.log('Here')
+        //return
+        let priceBuilder = AdsApp.extensions().newPriceBuilder();
+        var priceOperation = priceBuilder
+            .withPriceType("PRODUCT_CATEGORIES")             // required
+            .withLanguage("en")
+        const priceItems = cat_items.map(i => createPriceItem(i)).map(i => (priceOperation.addPriceItem(i)))
+        priceOperation = priceOperation.build()
+
+        if (!priceOperation.isSuccessful()) Logger.log(priceOperation.getErrors())
+
+        const price = priceOperation.getResult()
+        for (let id of adgroups) {
+            const adgroupIterator = AdsApp.adGroups().withCondition(`ad_group.id="${id}"`).get()
+            if (!adgroupIterator.hasNext()) continue
+            const adgroup = adgroupIterator.next()
+            adgroup.addPrice(price)
+        }
+    }
+
+}
+
+function connectMerchant(merchant_id, stats) {
+
+    var pageToken;
+    var pageNum = 1;
+    var maxResults = 250;
+    var products = {};
+
+    do {
+        var productList = ShoppingContent.Products.list(merchant_id, {
+            pageToken: pageToken,
+            maxResults: maxResults
+        });
+
+        if (productList.resources) {
+            for (var i = 0; i < productList.resources.length; i++) {
+                const product = productList.resources[i]
+                if (product.productTypes == null || product.productTypes.length == 0) continue
+                const cat = product.productTypes[0].split(" > ").pop()
+                // We'll only check for products that are in stock
+                let cur_cat = products[cat]
+
+                if (product["availability"] == "in stock" || (cur_cat == null || cur_cat[product.offerId] == null)) {
+                    cur_cat = cur_cat || {}
+                    //console.log(product)
+                    const sales = stats[product.offerId.toString()] || 0
+                    const item = {
+                        id: product.offerId.toString(),
+                        title: product.title.substring(0, 25),
+                        description: typeof product.description === "undefined" ? "" : product.description.substring(0, 25),
+                        price: parseFloat(product.price.value),
+                        sales,
+                        url: product.link
+                    }
+                    // product["price"]["value"] = product["salePrice"] ? products[i]["salePrice"] : product["price"]["value"];
+                    cur_cat[product.offerId.toString()] = item
+                    products[cat] = cur_cat
+                }
+            }
+        }
+        //break
+        pageToken = productList.nextPageToken;
+        pageNum++;
+    } while (pageToken);
+
+    return products;
+
+}
+
+function getStats(days) {
+    let result = {}
+    const [start, end] = getDates(days)
+    const searchResults = AdsApp.search(`SELECT segments.product_item_id, metrics.conversions
+                                         FROM shopping_performance_view
+                                         WHERE segments.date >= '${start}'
+                                           AND segments.date <= '${end}'`)
+    for (let row of searchResults) {
+        if (row?.segments?.productItemId == null) continue
+        //Logger.log(row)
+        result[row.segments.productItemId] = parseFloat(row.metrics.conversions)
+    }
+    return result
+}
+
+
+function getDates(days) {
+    const start = Utilities.formatDate(new Date(Date.now() - days * 86400000), AdsApp.currentAccount().getTimeZone(), "yyyy-MM-dd")
+    const end = Utilities.formatDate(new Date(Date.now() - 1 * 86400000), AdsApp.currentAccount().getTimeZone(), "yyyy-MM-dd")
+    return [start, end]
+}
+
+function costMicros(cost) {
+    return parseInt(cost || 0) / 1000000
+}
+
+function get_label_id(Labelname) {
+    const customerId = AdsApp.currentAccount().getCustomerId().replaceAll("-", "");
+    const labelIterator = AdsApp.labels()
+        .withCondition(`label.name = "${Labelname}"`)
+        .get();
+    if (labelIterator.hasNext()) {
+        const label = labelIterator.next().getId();
+        return `ad_group.labels CONTAINS ALL ('customers/${customerId}/labels/${label}') `;
+    }
+    return null;
+}
+
+function getAdGroups(label_query) {
+    let result = []
+    const searchResults = AdsApp.search(`SELECT ad_group.id
+                                         FROM ad_group
+                                         WHERE ${label_query}`)
+    for (let {adGroup} of searchResults) {
+        result.push(adGroup.id)
+    }
+    return result
+}
+
+function createPriceItem(obj) {
+    var priceItemBuilder = AdsApp.extensions().newPriceItemBuilder();
+    var priceItemOperation = priceItemBuilder
+        .withHeader(obj.title.substring(0, 25))               // required
+        .withDescription(obj.description.substring(0, 25))         // required
+        .withAmount(obj.price)                            // required
+        .withCurrencyCode(AdsApp.currentAccount().getCurrencyCode())      // required
+        .withUnitType("UNSPECIFIED")                  // required
+        .withFinalUrl(obj.url)   // required
+        .build();
+    return priceItemOperation.getResult()
+
+}
